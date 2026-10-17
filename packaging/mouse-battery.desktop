@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=鼠标电量
+Name[en]=MouseBattery
+Comment=查看无线鼠标的剩余电量和充电状态
+Comment[en]=Show wireless mouse battery level and charging state
+Exec=MouseBattery
+Icon=mouse-battery
+Terminal=false
+Categories=Utility;HardwareSettings;
+Keywords=mouse;battery;charging;hid;

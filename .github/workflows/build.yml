@@ -1,0 +1,234 @@
+name: Build and package
+
+"on":
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_VERSION: "6.8.2"
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libxcb-cursor0 \
+            patchelf \
+            squashfs-tools
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -eux
+          mkdir -p tools dist
+          curl -fL -o tools/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          curl -fL -o tools/linuxdeploy-plugin-qt \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x tools/linuxdeploy tools/linuxdeploy-plugin-qt
+          export PATH="$PWD/tools:$PATH"
+
+          APPDIR="$PWD/dist/AppDir"
+          install -Dm755 build/MouseBattery "$APPDIR/usr/bin/MouseBattery"
+          install -Dm644 packaging/mouse-battery.desktop \
+            "$APPDIR/usr/share/applications/mouse-battery.desktop"
+          install -Dm644 packaging/mouse-battery.png \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps/mouse-battery.png"
+          install -Dm644 README.md "$APPDIR/usr/share/doc/mousebattery/README.md"
+          install -Dm644 THIRD_PARTY_NOTICES.md \
+            "$APPDIR/usr/share/doc/mousebattery/THIRD_PARTY_NOTICES.md"
+          install -Dm644 udev/70-compx-mouse-battery.rules \
+            "$APPDIR/usr/share/mousebattery/udev/70-compx-mouse-battery.rules"
+          install -Dm755 scripts/install-udev-rule.sh \
+            "$APPDIR/usr/share/mousebattery/scripts/install-udev-rule.sh"
+
+          linuxdeploy --appdir "$APPDIR" \
+            --executable "$APPDIR/usr/bin/MouseBattery" \
+            --desktop-file "$APPDIR/usr/share/applications/mouse-battery.desktop" \
+            --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/mouse-battery.png" \
+            --plugin qt \
+            --output appimage
+
+          APPIMAGE=$(find . -maxdepth 1 -name '*.AppImage' ! -name 'linuxdeploy*' | head -n 1)
+          test -n "$APPIMAGE"
+          mv "$APPIMAGE" dist/MouseBattery-linux-x86_64.AppImage
+
+      - name: Build tarball
+        run: |
+          set -eux
+          mkdir -p dist/MouseBattery-linux-x86_64
+          install -m755 build/MouseBattery dist/MouseBattery-linux-x86_64/MouseBattery
+          cp -r udev scripts README.md THIRD_PARTY_NOTICES.md \
+            dist/MouseBattery-linux-x86_64/
+          tar -C dist -czf dist/MouseBattery-linux-x86_64.tar.gz \
+            MouseBattery-linux-x86_64
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MouseBattery-linux-x86_64
+          path: |
+            dist/MouseBattery-linux-x86_64.AppImage
+            dist/MouseBattery-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --parallel
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/MouseBattery.exe dist/
+          windeployqt --release --no-translations --compiler-runtime `
+            --dir dist dist/MouseBattery.exe
+          Copy-Item README.md, THIRD_PARTY_NOTICES.md dist/
+          Compress-Archive -Path dist/* `
+            -DestinationPath MouseBattery-windows-x86_64.zip -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MouseBattery-windows-x86_64
+          path: MouseBattery-windows-x86_64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: clang_64
+          cache: true
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: |
+          set -eux
+          macdeployqt build/MouseBattery.app -always-overwrite
+          codesign --force --deep --sign - build/MouseBattery.app
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/MouseBattery.app MouseBattery-macos.zip
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MouseBattery-macos
+          path: MouseBattery-macos.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

@@ -1,0 +1,12 @@
+# The 70- prefix matters: TAG+="uaccess" must be applied before
+# 73-seat-late.rules processes the ACL.
+#
+# Compx / ATK wireless mouse receivers (e.g. 373b:11fe, 8K NANO dongle-L).
+# TAG+="uaccess" grants the active desktop user access to the hidraw node
+# through systemd-logind, without world-writable permissions.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="373b", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3554", TAG+="uaccess"
+
+# Fallback for systems without logind/uaccess support: uncomment and make
+# sure your user is in the plugdev group.
+# SUBSYSTEM=="hidraw", ATTRS{idVendor}=="373b", MODE="0660", GROUP="plugdev"

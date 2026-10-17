@@ -1,0 +1,10 @@
+build/
+build-*/
+*.user
+*.autosave
+compile_commands.json
+.DS_Store
+Thumbs.db
+*.dSYM/
+.vscode/
+.idea/
