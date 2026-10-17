@@ -169,28 +169,26 @@ QList<MouseHidDevice> BatteryDevice::discover()
     return result;
 }
 
-BatteryReading BatteryDevice::query(const MouseHidDevice &device, int timeoutMs)
+bool BatteryDevice::transact(const MouseHidDevice &device, const QByteArray &packet,
+                             quint8 expectedOp, int expectedAddress,
+                             bool expectResponse, QByteArray *response,
+                             QString *error, int timeoutMs)
 {
-    BatteryReading reading;
-    reading.mode = device.mode.isEmpty() ? modeFor(device) : device.mode;
-    reading.deviceName = device.name;
-    reading.devicePath = device.displayPath;
-    reading.updatedAt = QDateTime::currentDateTime();
-
     FdGuard guard;
     guard.fd = ::open(device.backendPath.constData(),
                       O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (guard.fd < 0) {
-        reading.error = openErrorText(errno);
-        return reading;
+        if (error != nullptr) {
+            *error = openErrorText(errno);
+        }
+        return false;
     }
 
-    const QByteArray request = buildBatteryRequest();
     QElapsedTimer timer;
     timer.start();
 
     qsizetype written = 0;
-    while (written < request.size() && timer.elapsed() < timeoutMs) {
+    while (written < packet.size() && timer.elapsed() < timeoutMs) {
         pollfd descriptor{};
         descriptor.fd = guard.fd;
         descriptor.events = POLLOUT;
@@ -201,33 +199,43 @@ BatteryReading BatteryDevice::query(const MouseHidDevice &device, int timeoutMs)
             if (errno == EINTR) {
                 continue;
             }
-            reading.error = QStringLiteral("等待 HID 设备可写时失败：%1")
-                                .arg(errnoText(errno));
-            return reading;
+            if (error != nullptr) {
+                *error = QStringLiteral("等待 HID 设备可写时失败：%1")
+                             .arg(errnoText(errno));
+            }
+            return false;
         }
         if (pollResult == 0) {
             break;
         }
 
         const ssize_t count = ::write(guard.fd,
-                                      request.constData() + written,
-                                      static_cast<size_t>(request.size() - written));
+                                      packet.constData() + written,
+                                      static_cast<size_t>(packet.size() - written));
         if (count < 0) {
             if (errno == EINTR || errno == EAGAIN) {
                 continue;
             }
-            reading.error = QStringLiteral("发送电量查询失败：%1").arg(errnoText(errno));
-            return reading;
+            if (error != nullptr) {
+                *error = QStringLiteral("发送 HID 命令失败：%1").arg(errnoText(errno));
+            }
+            return false;
         }
         written += count;
     }
 
-    if (written != request.size()) {
-        reading.error = QStringLiteral("发送电量查询超时。");
-        return reading;
+    if (written != packet.size()) {
+        if (error != nullptr) {
+            *error = QStringLiteral("发送 HID 命令超时。");
+        }
+        return false;
     }
 
-    QString lastParseError;
+    if (!expectResponse) {
+        return true;
+    }
+
+    QString lastError;
     char buffer[128];
     while (timer.elapsed() < timeoutMs) {
         pollfd descriptor{};
@@ -240,9 +248,11 @@ BatteryReading BatteryDevice::query(const MouseHidDevice &device, int timeoutMs)
             if (errno == EINTR) {
                 continue;
             }
-            reading.error = QStringLiteral("等待鼠标响应时失败：%1")
-                                .arg(errnoText(errno));
-            return reading;
+            if (error != nullptr) {
+                *error = QStringLiteral("等待鼠标响应时失败：%1")
+                             .arg(errnoText(errno));
+            }
+            return false;
         }
         if (pollResult == 0) {
             break;
@@ -253,33 +263,90 @@ BatteryReading BatteryDevice::query(const MouseHidDevice &device, int timeoutMs)
             if (errno == EINTR || errno == EAGAIN) {
                 continue;
             }
-            if (errno == ENODEV || errno == EIO) {
-                reading.error = QStringLiteral("鼠标已断开连接。");
-            } else {
-                reading.error = QStringLiteral("读取鼠标响应失败：%1")
-                                    .arg(errnoText(errno));
+            if (error != nullptr) {
+                *error = QStringLiteral("读取鼠标响应失败：%1")
+                             .arg(errnoText(errno));
             }
-            return reading;
+            return false;
         }
         if (count == 0) {
             continue;
         }
 
-        const QByteArray frame(buffer, static_cast<int>(count));
-        QString parseError;
-        if (parseBatteryFrame(frame, &reading, &parseError)) {
-            reading.updatedAt = QDateTime::currentDateTime();
-            return reading;
+        QByteArray frame(buffer, static_cast<int>(count));
+        if (frame.size() > 17) {
+            frame.truncate(17);
         }
-        lastParseError = parseError;
+        if (frame.size() == 16
+            && (static_cast<quint8>(frame.at(0)) == expectedOp
+                || static_cast<quint8>(frame.at(0)) == 0x07
+                || static_cast<quint8>(frame.at(0)) == 0x08)) {
+            frame.prepend(static_cast<char>(0x08));
+        }
+        if (frame.size() != 17 || static_cast<quint8>(frame.at(0)) != 0x08) {
+            continue;
+        }
+
+        quint8 checksum = 0;
+        for (const char byte : frame) {
+            checksum = static_cast<quint8>(checksum + static_cast<quint8>(byte));
+        }
+        if (checksum != 0x55) {
+            lastError = QStringLiteral("响应校验和错误。");
+            continue;
+        }
+
+        const quint8 responseOp = static_cast<quint8>(frame.at(1));
+        if (responseOp != expectedOp
+            && !(expectedOp == 0x08 && responseOp == 0x07)) {
+            continue;
+        }
+        if (expectedAddress >= 0) {
+            const int responseAddress = (static_cast<quint8>(frame.at(3)) << 8)
+                | static_cast<quint8>(frame.at(4));
+            if (responseAddress != expectedAddress) {
+                continue;
+            }
+        }
+
+        if (response != nullptr) {
+            *response = frame;
+        }
+        return true;
     }
 
-    reading.available = false;
-    reading.error = QStringLiteral(
-        "鼠标没有响应。它可能已休眠，或接收器正被其他程序占用。"
-        "动一下鼠标后点击“立即刷新”再试。");
-    if (!lastParseError.isEmpty()) {
-        reading.error += QStringLiteral("\n最后一次响应：%1").arg(lastParseError);
+    if (error != nullptr) {
+        *error = QStringLiteral(
+            "鼠标没有响应。它可能已休眠，或接收器正被其他程序占用。"
+            "动一下鼠标后重试。");
+        if (!lastError.isEmpty()) {
+            *error += QStringLiteral("\n最后一次响应：%1").arg(lastError);
+        }
+    }
+    return false;
+}
+
+BatteryReading BatteryDevice::query(const MouseHidDevice &device, int timeoutMs)
+{
+    BatteryReading reading;
+    reading.mode = device.mode.isEmpty() ? modeFor(device) : device.mode;
+    reading.deviceName = device.name;
+    reading.devicePath = device.displayPath;
+    reading.updatedAt = QDateTime::currentDateTime();
+
+    QByteArray response;
+    QString error;
+    if (!transact(device, buildBatteryRequest(), 0x04, -1, true, &response, &error,
+                  timeoutMs)) {
+        reading.error = error;
+        reading.updatedAt = QDateTime::currentDateTime();
+        return reading;
+    }
+
+    QString parseError;
+    if (!parseBatteryFrame(response, &reading, &parseError)) {
+        reading.available = false;
+        reading.error = parseError;
     }
     reading.updatedAt = QDateTime::currentDateTime();
     return reading;

@@ -36,8 +36,19 @@ void BatteryReader::refresh()
     // Normally there is exactly one matching vendor interface. If several are
     // present, keep trying until one of them answers.
     for (const MouseHidDevice &device : devices) {
-        const BatteryReading reading = BatteryDevice::query(device);
+        BatteryReading reading = BatteryDevice::query(device);
         if (reading.available) {
+            DpiState dpi;
+            if (BatteryDevice::readDpi(device, &dpi)) {
+                reading.dpiAvailable = true;
+                reading.dpi = dpi.current;
+                reading.dpiStages = dpi.stages;
+                reading.dpiStageIndex = dpi.stageIndex;
+            } else {
+                reading.dpiAvailable = false;
+                reading.dpiError = dpi.error;
+            }
+
             m_busy = false;
             emit readingReady(reading);
             return;
@@ -47,4 +58,29 @@ void BatteryReader::refresh()
 
     m_busy = false;
     emit readingReady(result);
+}
+
+void BatteryReader::applyDpi(int dpi)
+{
+    const QList<MouseHidDevice> devices = BatteryDevice::discover();
+    if (devices.isEmpty()) {
+        emit dpiWriteFinished(false, dpi, QStringLiteral("未检测到鼠标接收器。"));
+        return;
+    }
+
+    QString lastError;
+    for (const MouseHidDevice &device : devices) {
+        DpiState state;
+        if (BatteryDevice::writeDpi(device, dpi, &state)) {
+            emit dpiWriteFinished(true, state.current,
+                                  state.current == dpi
+                                      ? QString()
+                                      : QStringLiteral("设备实际写入的 DPI 为 %1。")
+                                            .arg(state.current));
+            return;
+        }
+        lastError = state.error;
+    }
+
+    emit dpiWriteFinished(false, dpi, lastError);
 }

@@ -11,6 +11,7 @@
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QInputDialog>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLinearGradient>
@@ -130,8 +131,12 @@ MainWindow::MainWindow(bool demoMode, QWidget *parent)
 
     connect(this, &MainWindow::refreshRequested, m_reader, &BatteryReader::refresh,
             Qt::QueuedConnection);
+    connect(this, &MainWindow::dpiWriteRequested, m_reader, &BatteryReader::applyDpi,
+            Qt::QueuedConnection);
     connect(m_reader, &BatteryReader::readingReady, this, &MainWindow::applyReading,
             Qt::QueuedConnection);
+    connect(m_reader, &BatteryReader::dpiWriteFinished, this,
+            &MainWindow::handleDpiWriteFinished, Qt::QueuedConnection);
 
     m_workerThread->start();
     QTimer::singleShot(180, this, &MainWindow::refresh);
@@ -246,6 +251,23 @@ void MainWindow::buildUi()
             background-color: rgba(34, 211, 238, 24);
             border-color: rgba(34, 211, 238, 70);
         }
+        QPushButton#dpiButton {
+            color: #A5F3FC;
+            background-color: rgba(34, 211, 238, 18);
+            border: 1px solid rgba(34, 211, 238, 55);
+            border-radius: 12px;
+            padding: 8px 12px;
+            font-size: 11px;
+        }
+        QPushButton#dpiButton:hover {
+            background-color: rgba(34, 211, 238, 34);
+            border-color: rgba(34, 211, 238, 95);
+        }
+        QPushButton#dpiButton:disabled {
+            color: #64748B;
+            background-color: transparent;
+            border-color: rgba(148, 163, 184, 35);
+        }
         QPushButton#helpButton {
             color: #94A3B8;
             background: transparent;
@@ -323,7 +345,7 @@ void MainWindow::buildUi()
     auto *stats = new QHBoxLayout;
     stats->setSpacing(10);
     stats->addWidget(makeStatCard(QStringLiteral("电压"), &m_voltageValue), 1);
-    stats->addWidget(makeStatCard(QStringLiteral("连接"), &m_modeValue), 1);
+    stats->addWidget(makeStatCard(QStringLiteral("DPI"), &m_dpiValue), 1);
     stats->addWidget(makeStatCard(QStringLiteral("更新"), &m_updatedValue), 1);
 
     auto *controls = new QHBoxLayout;
@@ -335,6 +357,11 @@ void MainWindow::buildUi()
     m_autoButton->setChecked(true);
     m_autoButton->setCursor(Qt::PointingHandCursor);
     m_autoButton->setToolTip(QStringLiteral("每 30 秒自动读取一次电量"));
+
+    m_dpiButton = new QPushButton(QStringLiteral("更改 DPI"), this);
+    m_dpiButton->setObjectName(QStringLiteral("dpiButton"));
+    m_dpiButton->setCursor(Qt::PointingHandCursor);
+    m_dpiButton->setEnabled(false);
 
     m_helpButton = new QPushButton(QStringLiteral("帮助"), this);
     m_helpButton->setObjectName(QStringLiteral("helpButton"));
@@ -349,6 +376,7 @@ void MainWindow::buildUi()
 
     controls->addWidget(m_autoButton);
     controls->addStretch(1);
+    controls->addWidget(m_dpiButton);
     controls->addWidget(m_helpButton);
     controls->addWidget(m_refreshButton);
 
@@ -376,8 +404,10 @@ void MainWindow::buildUi()
     connect(m_autoButton, &QPushButton::toggled, this,
             &MainWindow::setAutoRefreshEnabled);
     connect(m_refreshButton, &QPushButton::clicked, this, &MainWindow::refresh);
+    connect(m_dpiButton, &QPushButton::clicked, this, &MainWindow::editDpi);
     connect(m_helpButton, &QPushButton::clicked, this, &MainWindow::showHelp);
 
+    updateDpiButton();
     m_autoRefreshTimer->start();
 }
 
@@ -426,9 +456,94 @@ void MainWindow::setBusy(bool busy)
     m_refreshButton->setText(busy ? QStringLiteral("读取中…")
                                   : QStringLiteral("立即刷新"));
     m_gauge->setBusy(busy);
+    updateDpiButton();
     if (busy) {
         updateStatusPill(QStringLiteral("读取中"), QStringLiteral("busy"));
     }
+}
+
+void MainWindow::updateDpiButton()
+{
+    if (m_dpiApplying) {
+        m_dpiButton->setText(QStringLiteral("写入中…"));
+        m_dpiButton->setEnabled(false);
+        return;
+    }
+
+    if (!m_dpiAvailable) {
+        m_dpiButton->setText(QStringLiteral("DPI 不可用"));
+        m_dpiButton->setEnabled(false);
+        m_dpiButton->setToolTip(m_dpiError.isEmpty()
+                                    ? QStringLiteral("当前设备没有提供 DPI 读取接口。")
+                                    : m_dpiError);
+        return;
+    }
+
+    m_dpiButton->setText(QStringLiteral("更改 DPI"));
+    m_dpiButton->setEnabled(!m_busy);
+    m_dpiButton->setToolTip(
+        QStringLiteral("当前第 %1/%2 档：%3 DPI")
+            .arg(m_dpiStageIndex + 1)
+            .arg(m_dpiStages)
+            .arg(m_currentDpi));
+}
+
+void MainWindow::editDpi()
+{
+    if (!m_dpiAvailable || m_dpiApplying || m_busy) {
+        return;
+    }
+
+    bool accepted = false;
+    const int requested = QInputDialog::getInt(
+        this,
+        QStringLiteral("设置 DPI"),
+        QStringLiteral("当前第 %1/%2 档，输入新的 DPI（50–42000）：")
+            .arg(m_dpiStageIndex + 1)
+            .arg(m_dpiStages),
+        m_currentDpi,
+        50,
+        42000,
+        10,
+        &accepted);
+    if (!accepted) {
+        return;
+    }
+
+    if (m_demoMode) {
+        m_currentDpi = requested;
+        m_dpiValue->setText(QString::number(requested));
+        updateDpiButton();
+        return;
+    }
+
+    m_dpiApplying = true;
+    updateDpiButton();
+    emit dpiWriteRequested(requested);
+}
+
+void MainWindow::handleDpiWriteFinished(bool success, int dpi, const QString &error)
+{
+    m_dpiApplying = false;
+
+    if (!success) {
+        updateDpiButton();
+        QMessageBox::warning(this, QStringLiteral("DPI 写入失败"),
+                             error.isEmpty()
+                                 ? QStringLiteral("设备没有确认 DPI 写入。")
+                                 : error);
+        return;
+    }
+
+    m_currentDpi = dpi;
+    m_dpiValue->setText(QString::number(dpi));
+    updateDpiButton();
+
+    if (!error.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("DPI 已写入"), error);
+    }
+
+    refresh();
 }
 
 void MainWindow::applyReading(const BatteryReading &reading)
@@ -445,10 +560,25 @@ void MainWindow::applyReading(const BatteryReading &reading)
 
         m_voltageValue->setText(
             QStringLiteral("%1 V").arg(reading.voltageMv / 1000.0, 0, 'f', 3));
-        m_modeValue->setText(reading.mode);
+        m_dpiAvailable = reading.dpiAvailable;
+        m_currentDpi = reading.dpi;
+        m_dpiStages = reading.dpiStages;
+        m_dpiStageIndex = reading.dpiStageIndex;
+        m_dpiError = reading.dpiError;
+        if (m_dpiAvailable) {
+            m_dpiValue->setText(QString::number(reading.dpi));
+            m_dpiValue->setToolTip(
+                QStringLiteral("第 %1/%2 档")
+                    .arg(reading.dpiStageIndex + 1)
+                    .arg(reading.dpiStages));
+        } else {
+            m_dpiValue->setText(QStringLiteral("—"));
+            m_dpiValue->setToolTip(reading.dpiError);
+        }
         m_updatedValue->setText(reading.updatedAt.toString(QStringLiteral("HH:mm:ss")));
         m_errorLabel->hide();
         m_helpButton->hide();
+        updateDpiButton();
         return;
     }
 
@@ -465,8 +595,14 @@ void MainWindow::updateReadingUi(const BatteryReading &reading)
 
     m_gauge->setReading(-1, false, false);
     m_voltageValue->setText(QStringLiteral("—"));
-    m_modeValue->setText(QStringLiteral("—"));
+    m_dpiValue->setText(QStringLiteral("—"));
     m_updatedValue->setText(QStringLiteral("—"));
+    m_dpiAvailable = false;
+    m_currentDpi = 0;
+    m_dpiStages = 0;
+    m_dpiStageIndex = 0;
+    m_dpiError = reading.dpiError;
+    updateDpiButton();
 
     updateErrorUi(reading);
 }
@@ -564,6 +700,10 @@ void MainWindow::showDemoReading()
     reading.mode = QStringLiteral("2.4G 无线");
     reading.deviceName = QStringLiteral("Compx Wireless mouse 8k NANO dongle-L");
     reading.devicePath = QStringLiteral("/dev/hidraw2");
+    reading.dpiAvailable = true;
+    reading.dpi = 800;
+    reading.dpiStages = 4;
+    reading.dpiStageIndex = 1;
     reading.updatedAt = QDateTime::currentDateTime();
     applyReading(reading);
 }

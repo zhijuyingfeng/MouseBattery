@@ -19,9 +19,24 @@ struct BatteryReading
     QString error;
     QByteArray rawFrame;
     QDateTime updatedAt;
+
+    bool dpiAvailable = false;
+    int dpi = 0;
+    int dpiStages = 0;
+    int dpiStageIndex = 0;
+    QString dpiError;
 };
 
 Q_DECLARE_METATYPE(BatteryReading)
+
+struct DpiState
+{
+    bool available = false;
+    int current = 0;
+    int stages = 0;
+    int stageIndex = 0;
+    QString error;
+};
 
 struct MouseHidDevice
 {
@@ -44,6 +59,10 @@ public:
 
     static BatteryReading query(const MouseHidDevice &device, int timeoutMs = 900);
 
+    static bool readDpi(const MouseHidDevice &device, DpiState *state, int timeoutMs = 1200);
+    static bool writeDpi(const MouseHidDevice &device, int dpi, DpiState *state,
+                         int timeoutMs = 1200);
+
     // Public for the small protocol test executable.
     static QByteArray buildBatteryRequest();
     static bool parseBatteryFrame(const QByteArray &frame, BatteryReading *reading,
@@ -52,4 +71,10 @@ public:
 
 private:
     static QString modeFor(const MouseHidDevice &device);
+
+    // Platform backends implement this. Packets include the report ID.
+    // expectedAddress may be -1 (battery query has no address).
+    static bool transact(const MouseHidDevice &device, const QByteArray &packet,
+                         quint8 expectedOp, int expectedAddress, bool expectResponse,
+                         QByteArray *response, QString *error, int timeoutMs);
 };
